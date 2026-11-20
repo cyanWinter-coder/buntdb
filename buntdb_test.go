@@ -2958,3 +2958,536 @@ func TestIssue112(t *testing.T) {
 		return err
 	})
 }
+
+// TestTxStableExpiration verifies that a write transaction judges expiration
+// against a single time point captured at Begin. An item whose TTL naturally
+// lapses while the transaction is open must remain observable (as expired)
+// for the whole transaction, and rolling back the transaction restores the
+// value, TTL, absolute expiration time and the expires tree.
+func TestTxStableExpiration(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	// Commit a short-lived item with an index backing it.
+	if err := db.CreateIndex("idx1", "*", IndexString); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("ephemeral", "v1",
+			&SetOptions{Expires: true, TTL: time.Millisecond * 40})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var exatBefore time.Time
+	if err := db.View(func(tx *Tx) error {
+		dbi := tx.db.get("ephemeral")
+		if dbi == nil || dbi.opts == nil || !dbi.opts.ex {
+			t.Fatal("expected an expiring item")
+		}
+		exatBefore = dbi.opts.exat
+		// sanity check the index holds the item
+		n := 0
+		if err := tx.Ascend("idx1", func(key, value string) bool {
+			n++
+			return true
+		}); err != nil {
+			return err
+		}
+		if n != 1 {
+			t.Fatalf("expected index length 1, got %d", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a write transaction and let the TTL lapse while it is in flight.
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := tx.now
+	time.Sleep(time.Millisecond * 80)
+
+	// The wall clock has passed the expiration, but the transaction's stable
+	// time point predates it, so the item must still be readable within the tx.
+	if _, err := tx.Get("ephemeral"); err != nil {
+		t.Fatalf("item should be visible at the pinned time point, got %v", err)
+	}
+	ttl, err := tx.TTL("ephemeral")
+	if err != nil {
+		t.Fatalf("TTL should be reported at the pinned time point, got %v", err)
+	}
+	if ttl <= 0 {
+		t.Fatalf("expected a positive remaining TTL at the pinned instant, got %v", ttl)
+	}
+	if dbi := tx.db.get("ephemeral"); dbi == nil || !dbi.opts.exat.Equal(exatBefore) {
+		t.Fatal("absolute expiration time changed inside the transaction")
+	}
+
+	// An explicit delete inside the same transaction must still see the item
+	// because the transaction does not consider it expired.
+	if _, err := tx.Delete("ephemeral"); err != nil {
+		t.Fatalf("delete against the stable time point should succeed, got %v", err)
+	}
+	if dbi := tx.db.get("ephemeral"); dbi != nil {
+		t.Fatal("expected the item to be removed from the live tree")
+	}
+	// The rollback bookkeeping retained the full item, including its TTL.
+	rb, ok := tx.wc.rollbackItems["ephemeral"]
+	if !ok || rb == nil || rb.opts == nil || !rb.opts.ex {
+		t.Fatal("rollback entry must retain the expiring item and its options")
+	}
+	if !rb.opts.exat.Equal(exatBefore) {
+		t.Fatal("rollback entry lost the original absolute expiration time")
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// After rollback the value, TTL and absolute expiration time are restored.
+	if err := db.View(func(tx *Tx) error {
+		dbi := tx.db.get("ephemeral")
+		if dbi == nil {
+			t.Fatal("item was not restored on rollback")
+		}
+		if dbi.val != "v1" {
+			t.Fatalf("expected restored value v1, got %q", dbi.val)
+		}
+		if dbi.opts == nil || !dbi.opts.ex || !dbi.opts.exat.Equal(exatBefore) {
+			t.Fatal("restored item lost its original expiration metadata")
+		}
+		// the expires tree must contain the restored item again (it is
+		// ordered by expiration time, so look the actual item up).
+		if tx.db.exps.Get(dbi) == nil {
+			t.Fatal("restored item missing from the expires tree")
+		}
+		// the btree index must contain the restored item as well
+		idx := tx.db.idxs["idx1"]
+		if idx == nil || idx.btr == nil || idx.btr.Get(dbi) == nil {
+			t.Fatal("restored item missing from the btree index")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pinned instant must really predate the natural expiration.
+	if !pinned.Before(exatBefore) {
+		t.Fatalf("pinned time %v should predate expiration %v", pinned, exatBefore)
+	}
+}
+
+// TestTxExpiredRollbackRestoresIndex opens a write transaction before an item
+// expires, lets the TTL lapse while the transaction is in flight, then
+// overwrites the item (removing it from the indexes and the expires tree) and
+// rolls back. Because expiration is judged at the transaction's stable time
+// point, the item is still treated as live inside the transaction and the
+// rollback must reinstate the value, TTL, expiration time and every index.
+func TestTxExpiredRollbackRestoresIndex(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.CreateIndex("idx1", "*", IndexString); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSpatialIndex("spatial", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("k", Point(1, 2),
+			&SetOptions{Expires: true, TTL: time.Millisecond * 40}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var original *dbItem
+	if err := db.View(func(tx *Tx) error {
+		original = tx.db.get("k")
+		if original == nil || original.opts == nil {
+			t.Fatal("missing original item")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open the write transaction before the TTL lapses.
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tx.now.Before(original.opts.exat) {
+		t.Fatal("transaction time point should predate the expiration")
+	}
+	// Let the TTL lapse on the wall clock while the transaction stays open.
+	time.Sleep(time.Millisecond * 80)
+
+	// At the pinned time point the item is still live, so Set replaces it and
+	// records the previous item (with its TTL) for rollback.
+	prev, replaced, err := tx.Set("k", "replaced", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced || prev != Point(1, 2) {
+		t.Fatalf("expected replacement of live item, got replaced=%v prev=%q",
+			replaced, prev)
+	}
+	if dbi := tx.db.get("k"); dbi == nil || dbi.opts != nil {
+		t.Fatal("expected the replacement item without expiration options")
+	}
+	// The replacement must have removed the original from the indexes.
+	if got := tx.db.idxs["idx1"].btr.Len(); got != 1 {
+		t.Fatalf("expected index to hold replacement item, got %d", got)
+	}
+	if tx.db.exps.Len() != 0 {
+		t.Fatalf("expected empty expires tree after replacement, got %d",
+			tx.db.exps.Len())
+	}
+	// Rollback bookkeeping retained the full original item.
+	rb := tx.wc.rollbackItems["k"]
+	if rb == nil || rb.opts == nil || !rb.opts.exat.Equal(original.opts.exat) {
+		t.Fatal("rollback entry lost the original expiration metadata")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rollback must reinstate the original item with all of its metadata and
+	// reinsert it into every index plus the expires tree.
+	if err := db.View(func(tx *Tx) error {
+		dbi := tx.db.get("k")
+		if dbi == nil {
+			t.Fatal("item missing after rollback")
+		}
+		if dbi.val != original.val {
+			t.Fatalf("value not restored: %q != %q", dbi.val, original.val)
+		}
+		if dbi.opts == nil || !dbi.opts.ex ||
+			!dbi.opts.exat.Equal(original.opts.exat) {
+			t.Fatal("expiration metadata not restored on rollback")
+		}
+		if tx.db.exps.Get(dbi) == nil {
+			t.Fatal("item missing from expires tree after rollback")
+		}
+		idx := tx.db.idxs["idx1"]
+		if idx == nil || idx.btr == nil || idx.btr.Get(dbi) == nil {
+			t.Fatal("item missing from btree index after rollback")
+		}
+		var sseen bool
+		if err := tx.Intersects("spatial", Rect([]float64{0, 0}, []float64{2, 3}),
+			func(key, value string) bool {
+				if key == "k" {
+					sseen = true
+				}
+				return true
+			}); err != nil {
+			return err
+		}
+		if !sseen {
+			t.Fatal("item missing from spatial index after rollback")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTxUncommittedExpiryNotPersisted ensures that deletions performed against
+// items that expire inside an open write transaction are never written to the
+// AOF when the transaction is rolled back.
+func TestTxUncommittedExpiryNotPersisted(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("k", "v",
+			&SetOptions{Expires: true, TTL: time.Millisecond * 40})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond * 80)
+	// Delete the (naturally expired) item inside the open transaction.
+	if _, err := tx.Delete("k"); err != nil {
+		t.Fatal(err)
+	}
+	if len(tx.wc.commitItems) != 1 {
+		t.Fatalf("expected one pending commit record, got %d", len(tx.wc.commitItems))
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing from the rolled-back transaction may have reached the file.
+	data, err := ioutil.ReadFile("data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(data, []byte("del")) != 0 {
+		t.Fatalf("rolled-back delete was persisted to the AOF: %q", data)
+	}
+	if bytes.Count(data, []byte("set")) != 1 {
+		t.Fatalf("expected only the original set record, got %q", data)
+	}
+
+	// Reopening replays the AOF. The item expired in the meantime and must not
+	// be loaded as a live entry.
+	db = testReOpen(t, db)
+	defer testClose(db)
+	if err := db.View(func(tx *Tx) error {
+		if tx.db.get("k") != nil {
+			t.Fatal("expired item should not be reloaded as a live entry")
+		}
+		if tx.db.keys.Len() != 0 {
+			t.Fatalf("expected an empty database, len=%d", tx.db.keys.Len())
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestShrinkConcurrentWithTx ensures a shrink never observes the in-progress
+// state of an open write transaction: it can only snapshot committed data.
+// Because a write transaction holds the database's write lock for its whole
+// lifetime, a shrink started while it is open must block until the transaction
+// finishes rather than read uncommitted state.
+func TestShrinkConcurrentWithTx(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 100; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("committed:%d", i), "v", nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a write transaction, make uncommitted changes, and hold the lock.
+	wtx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, _, err := wtx.Set(fmt.Sprintf("uncommitted:%d", i), "v", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := wtx.Delete(fmt.Sprintf("committed:%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := wtx.Len(); err != nil || n != 100 {
+		t.Fatalf("write tx expected 100 live items, got %d (%v)", n, err)
+	}
+
+	// Shrink takes the same write lock, so it must block until the write
+	// transaction finishes. It must never read the uncommitted state.
+	done := make(chan error, 1)
+	go func() { done <- db.Shrink() }()
+
+	// Give the shrink goroutine time to attempt (and block on) the lock.
+	time.Sleep(time.Millisecond * 100)
+	select {
+	case err := <-done:
+		t.Fatalf("shrink ran while a write transaction was open: %v", err)
+	default:
+	}
+
+	if err := wtx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("shrink after rollback failed: %v", err)
+	}
+
+	// The shrunken AOF must contain only committed items.
+	data, err := ioutil.ReadFile("data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("uncommitted")) {
+		t.Fatal("shrink persisted uncommitted transaction state")
+	}
+	for i := 0; i < 100; i++ {
+		if !bytes.Contains(data, []byte(fmt.Sprintf("committed:%d", i))) {
+			t.Fatalf("shrink lost committed key committed:%d", i)
+		}
+	}
+
+	// A subsequent committed write must survive the next shrink, while a write
+	// that is never committed must not appear.
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("after-shrink", "v", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Shrink(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = ioutil.ReadFile("data.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte("after-shrink")) {
+		t.Fatal("committed data missing from shrunken file")
+	}
+}
+
+// TestShrinkConcurrentReadOnlyTx verifies that a read-only transaction keeps a
+// consistent committed view while a shrink is running. The shrink performs its
+// snapshot under read locks, so readers must never observe partial or
+// in-progress state.
+func TestShrinkConcurrentReadOnlyTx(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 100; i++ {
+			if _, _, err := tx.Set(fmt.Sprintf("key:%d", i), "v", nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	shrinkDone := make(chan error, 1)
+	go func() { shrinkDone <- db.Shrink() }()
+
+	// Repeatedly open short read transactions while the shrink runs. Each must
+	// observe the full committed dataset.
+	deadline := time.Now().Add(time.Second * 3)
+	for time.Now().Before(deadline) {
+		if err := db.View(func(tx *Tx) error {
+			if n, err := tx.Len(); err != nil {
+				return err
+			} else if n != 100 {
+				t.Fatalf("read tx observed %d items, expected 100", n)
+			}
+			val, err := tx.Get("key:42")
+			if err != nil || val != "v" {
+				t.Fatalf("read tx lost committed data: val=%q err=%v", val, err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-shrinkDone:
+			if err != nil {
+				t.Fatalf("shrink failed: %v", err)
+			}
+			shrinkDone = nil
+		default:
+		}
+		if shrinkDone == nil {
+			break
+		}
+	}
+	if shrinkDone != nil {
+		if err := <-shrinkDone; err != nil {
+			t.Fatalf("shrink failed: %v", err)
+		}
+	}
+
+	// After the shrink, committed data is still fully readable.
+	if err := db.View(func(tx *Tx) error {
+		if n, err := tx.Len(); err != nil || n != 100 {
+			t.Fatalf("post-shrink expected 100 items, got %d (%v)", n, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTxStableExpirationCommit confirms the normal commit path still uses the
+// committed TTL and that read-only transactions keep observing wall-clock
+// expiration (their semantics are unchanged).
+func TestTxStableExpirationCommit(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("k", "v",
+			&SetOptions{Expires: true, TTL: time.Millisecond * 40})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A read-only transaction opened before expiry and read after the TTL
+	// lapses must observe wall-clock expiration, i.e. read semantics are
+	// unchanged.
+	rtx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond * 80)
+	if _, err := rtx.Get("k"); err != ErrNotFound {
+		t.Fatalf("read-only tx should observe wall-clock expiry, got %v", err)
+	}
+	if err := rtx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh write transaction can still commit normally. The expired item
+	// may have been swept by the background manager or be removed here; either
+	// way the commit path and persistence semantics are unchanged.
+	if err := db.Update(func(tx *Tx) error {
+		_, _ = tx.Delete("k")
+		if _, _, err := tx.Set("k2", "v2", nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		if _, err := tx.Get("k2"); err != nil {
+			t.Fatalf("committed item not readable: %v", err)
+		}
+		// A read-only tx observes wall-clock expiration, so the item is never
+		// visible even if its tree entry has not been swept yet.
+		if _, err := tx.Get("k"); err != ErrNotFound {
+			t.Fatalf("expired item should not be readable, got %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening confirms the committed replacement persisted and the expired
+	// item did not.
+	db = testReOpen(t, db)
+	defer testClose(db)
+	if err := db.View(func(tx *Tx) error {
+		if _, err := tx.Get("k2"); err != nil {
+			t.Fatalf("committed item lost across reopen: %v", err)
+		}
+		if tx.db.get("k") != nil {
+			t.Fatal("expired item resurrected across reopen")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

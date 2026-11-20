@@ -573,7 +573,7 @@ func (db *DB) backgroundManager() {
 			}
 			// produce a list of expired items that need removing
 			btreeAscendLessThan(db.exps, &dbItem{
-				opts: &dbItemOpts{ex: true, exat: time.Now()},
+				opts: &dbItemOpts{ex: true, exat: tx.timeNow()},
 			}, func(item interface{}) bool {
 				expired = append(expired, item.(*dbItem))
 				return true
@@ -1088,6 +1088,7 @@ type Tx struct {
 	writable bool            // when false mutable operations fail.
 	funcd    bool            // when true Commit and Rollback panic.
 	wc       *txWriteContext // context for writable transactions.
+	now      time.Time       // the stable time point used for expiration checks.
 }
 
 type txWriteContext struct {
@@ -1162,6 +1163,12 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		if db.persist {
 			tx.wc.commitItems = make(map[string]*dbItem)
 		}
+		// Pin a stable time point for the whole transaction. Every
+		// expiration check inside this transaction must use this same
+		// instant so that an item whose TTL naturally lapses while the
+		// transaction is in progress is treated consistently. A rollback
+		// can then restore the item and its expiration metadata intact.
+		tx.now = time.Now()
 	}
 	return tx, nil
 }
@@ -1403,10 +1410,38 @@ func (dbi *dbItem) writeDeleteTo(buf []byte) []byte {
 	return buf
 }
 
-// expired evaluates id the item has expired. This will always return false when
-// the item does not have `opts.ex` set to true.
+// expiredAt evaluates whether the item has expired relative to the provided
+// time point. This will always return false when the item does not have
+// `opts.ex` set to true.
+func (dbi *dbItem) expiredAt(now time.Time) bool {
+	return dbi.opts != nil && dbi.opts.ex && now.After(dbi.opts.exat)
+}
+
+// expired evaluates if the item has expired against the current wall clock.
+// This will always return false when the item does not have `opts.ex` set to
+// true. Code running inside a transaction must use (*Tx).expired instead, so
+// that the transaction's stable time point is used.
 func (dbi *dbItem) expired() bool {
-	return dbi.opts != nil && dbi.opts.ex && time.Now().After(dbi.opts.exat)
+	return dbi.expiredAt(time.Now())
+}
+
+// timeNow returns the time point against which expiration should be evaluated
+// for this transaction. Writable transactions pin the time at Begin so the
+// outcome of every operation is stable for the whole transaction; read-only
+// transactions observe the current wall-clock time on each call, preserving
+// the existing read semantics.
+func (tx *Tx) timeNow() time.Time {
+	if tx.writable {
+		return tx.now
+	}
+	return time.Now()
+}
+
+// expired reports whether the item is expired relative to this transaction's
+// time point. Writable transactions use the time captured at Begin, while
+// read-only transactions use the current wall-clock time.
+func (tx *Tx) expired(dbi *dbItem) bool {
+	return dbi.expiredAt(tx.timeNow())
 }
 
 // MaxTime from http://stackoverflow.com/questions/25065055#32620397
@@ -1539,8 +1574,16 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 	if opts != nil {
 		if opts.Expires {
 			// The caller is requesting that this item expires. Convert the
-			// TTL to an absolute time and bind it to the item.
-			item.opts = &dbItemOpts{ex: true, exat: time.Now().Add(opts.TTL)}
+			// TTL to an absolute time and bind it to the item. The absolute
+			// time is derived from the transaction's stable time point.
+			exat := tx.timeNow().Add(opts.TTL)
+			if opts.TTL <= 0 {
+				// A non-positive TTL means the item is already expired. Pin
+				// the expiration strictly in the past so that the stable
+				// time point also observes the item as expired.
+				exat = tx.timeNow().Add(-time.Nanosecond)
+			}
+			item.opts = &dbItemOpts{ex: true, exat: exat}
 		}
 	}
 	// Insert the item into the keys tree.
@@ -1564,7 +1607,7 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 			if _, ok := tx.wc.rollbackItems[key]; !ok {
 				tx.wc.rollbackItems[key] = prev
 			}
-			if !prev.expired() {
+			if !tx.expired(prev) {
 				previousValue, replaced = prev.val, true
 			}
 		}
@@ -1589,7 +1632,7 @@ func (tx *Tx) Get(key string, ignoreExpired ...bool) (val string, err error) {
 		ignore = ignoreExpired[0]
 	}
 	item := tx.db.get(key)
-	if item == nil || (item.expired() && !ignore) {
+	if item == nil || (tx.expired(item) && !ignore) {
 		// The item does not exists or has expired. Let's assume that
 		// the caller is only interested in items that have not expired.
 		return "", ErrNotFound
@@ -1625,7 +1668,7 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 	}
 	// Even though the item has been deleted, we still want to check
 	// if it has expired. An expired item should not be returned.
-	if item.expired() {
+	if tx.expired(item) {
 		// The item exists in the tree, but has expired. Let's assume that
 		// the caller is only interested in items that have not expired.
 		return "", ErrNotFound
@@ -1646,7 +1689,7 @@ func (tx *Tx) TTL(key string) (time.Duration, error) {
 	} else if item.opts == nil || !item.opts.ex {
 		return -1, nil
 	}
-	dur := time.Until(item.opts.exat)
+	dur := item.opts.exat.Sub(tx.timeNow())
 	if dur < 0 {
 		return 0, ErrNotFound
 	}
@@ -1671,7 +1714,7 @@ func (tx *Tx) scan(desc, gt, lt bool, index, start, stop string,
 	// wrap a btree specific iterator around the user-defined iterator.
 	iter := func(item interface{}) bool {
 		dbi := item.(*dbItem)
-		if dbi.expired() {
+		if tx.expired(dbi) {
 			return true
 		}
 		return iterator(dbi.key, dbi.val)
