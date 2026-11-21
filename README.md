@@ -451,6 +451,37 @@ db.View(func(tx *buntdb.Tx) error {
 // 2: {"name":{"first":"Janet","last":"Prichard"},"age":47}
 ```
 
+## Online Index Rebuild
+An index definition, such as a JSON path expression, can be changed while
+the database keeps serving reads and writes. `BeginIndexRebuild` builds the
+new index in a candidate structure from a consistent snapshot of the live
+keys; changes committed while the build is registered are replayed into the
+candidate. `Commit` then atomically switches the new index in — read
+transactions that started before the switch keep using the old index, and
+new transactions immediately use the new definition. If the build is
+aborted or the switch fails, the old index keeps serving.
+
+```go
+db, _ := buntdb.Open(":memory:")
+// ... index "age" exists on the "age" field and needs to move to "meta.age"
+rb, err := db.BeginIndexRebuild(buntdb.JSONIndexSpec("age", "*", "meta.age"))
+if err != nil {
+	log.Fatal(err)
+}
+// writes and reads continue here; the old index keeps serving
+if err := rb.Commit(); err != nil {
+	// ErrIndexDefChanged: the index was dropped or replaced concurrently.
+	// The candidate has been discarded and the old index is untouched.
+	log.Fatal(err)
+}
+```
+
+Definitions are compared through the spec: rebuilding a name whose existing
+definition is identical returns `ErrIndexExists`, and a same-named index
+with a different expression is fully rebuilt and atomically replaced, never
+silently mixing entries from the two definitions. Call `rb.Abort()` to
+discard the candidate at any time before `Commit`.
+
 ## Descending Ordered Index
 Any index can be put in descending order by wrapping it's less function with `buntdb.Desc`.
 

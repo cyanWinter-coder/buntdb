@@ -60,6 +60,19 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrIndexRebuildInProcess is returned when an online index rebuild for
+	// the same index name is already in-process.
+	ErrIndexRebuildInProcess = errors.New("index rebuild is in-process")
+
+	// ErrIndexRebuildClosed is returned when using an index rebuild handle
+	// that has already been committed or aborted.
+	ErrIndexRebuildClosed = errors.New("index rebuild closed")
+
+	// ErrIndexDefChanged is returned when the live index definition changed
+	// (or the index was dropped) while an online rebuild was building, so
+	// the candidate index cannot be safely switched in.
+	ErrIndexDefChanged = errors.New("index definition changed")
 )
 
 const useAbsEx = true
@@ -80,6 +93,8 @@ type DB struct {
 	persist   bool              // do we write to disk
 	shrinking bool              // when an aof shrink is in-process.
 	lastaofsz int               // the size of the last shrink aof size
+	rebuilds  []*IndexRebuild   // in-process online index rebuilds
+	idxGen    uint64            // bumped when the dataset is reset (DeleteAll)
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -250,14 +265,15 @@ func (db *DB) Load(rd io.Reader) error {
 // index represents a b-tree or r-tree index and also acts as the
 // b-tree/r-tree context for itself.
 type index struct {
-	btr     *btree.BTree                           // contains the items
-	rtr     *rtred.RTree                           // contains the items
-	name    string                                 // name of the index
-	pattern string                                 // a required key pattern
-	less    func(a, b string) bool                 // less comparison function
-	rect    func(item string) (min, max []float64) // rect from string function
-	db      *DB                                    // the origin database
-	opts    IndexOptions                           // index options
+	btr        *btree.BTree                           // contains the items
+	rtr        *rtred.RTree                           // contains the items
+	name       string                                 // name of the index
+	pattern    string                                 // a required key pattern
+	expression string                                 // comparable ordering expression descriptor
+	less       func(a, b string) bool                 // less comparison function
+	rect       func(item string) (min, max []float64) // rect from string function
+	db         *DB                                    // the origin database
+	opts       IndexOptions                           // index options
 }
 
 // match matches the pattern to the key
@@ -280,12 +296,13 @@ func (idx *index) match(key string) bool {
 func (idx *index) clearCopy() *index {
 	// copy the index meta information
 	nidx := &index{
-		name:    idx.name,
-		pattern: idx.pattern,
-		db:      idx.db,
-		less:    idx.less,
-		rect:    idx.rect,
-		opts:    idx.opts,
+		name:       idx.name,
+		pattern:    idx.pattern,
+		expression: idx.expression,
+		db:         idx.db,
+		less:       idx.less,
+		rect:       idx.rect,
+		opts:       idx.opts,
 	}
 	// initialize with empty trees
 	if nidx.less != nil {
@@ -1159,9 +1176,10 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		tx.wc = &txWriteContext{}
 		tx.wc.rollbackItems = make(map[string]*dbItem)
 		tx.wc.rollbackIndexes = make(map[string]*index)
-		if db.persist {
-			tx.wc.commitItems = make(map[string]*dbItem)
-		}
+		// commitItems is always allocated, even for in-memory databases,
+		// because committed changes may need to be replayed into
+		// in-process online index rebuilds.
+		tx.wc.commitItems = make(map[string]*dbItem)
 	}
 	return tx, nil
 }
@@ -1270,6 +1288,27 @@ func (tx *Tx) Commit() error {
 		}
 		// Increment the number of flushes. The background syncing uses this.
 		tx.db.flushes++
+	}
+	// Replay the committed changes into any in-process online index
+	// rebuilds so their candidate indexes stay current with the live
+	// database. This only runs when the commit succeeded; rolled-back
+	// changes never reach the candidate structures.
+	if err == nil && len(tx.db.rebuilds) > 0 &&
+		(len(tx.wc.commitItems) > 0 || tx.wc.rbkeys != nil) {
+		if tx.wc.rbkeys != nil {
+			// DeleteAll was called in this transaction. The dataset was
+			// reset, so bump the generation and reset every candidate.
+			// Builders will restart their scans from an empty state.
+			tx.db.idxGen++
+			for _, rb := range tx.db.rebuilds {
+				rb.resetLocked()
+			}
+		}
+		for key, item := range tx.wc.commitItems {
+			for _, rb := range tx.db.rebuilds {
+				rb.applyLocked(key, item)
+			}
+		}
 	}
 	// Unlock the database and allow for another writable transaction.
 	tx.unlock()
@@ -1570,10 +1609,9 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 		}
 	}
 	// For commits we simply assign the item to the map. We use this map to
-	// write the entry to disk.
-	if tx.db.persist {
-		tx.wc.commitItems[key] = item
-	}
+	// write the entry to disk and to replay the change into in-process
+	// online index rebuilds.
+	tx.wc.commitItems[key] = item
 	return previousValue, replaced, nil
 }
 
@@ -1620,9 +1658,7 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 			tx.wc.rollbackItems[key] = item
 		}
 	}
-	if tx.db.persist {
-		tx.wc.commitItems[key] = nil
-	}
+	tx.wc.commitItems[key] = nil
 	// Even though the item has been deleted, we still want to check
 	// if it has expired. An expired item should not be returned.
 	if item.expired() {
@@ -2121,6 +2157,34 @@ func (tx *Tx) CreateSpatialIndexOptions(name, pattern string,
 	return tx.createIndex(name, pattern, nil, rect, nil)
 }
 
+// makeLessFunc generates a single less function from a series of less
+// functions. When multiple functions are provided, a compound less function
+// is created that compares each function in order.
+func makeLessFunc(lessers []func(a, b string) bool) func(a, b string) bool {
+	var less func(a, b string) bool
+	switch len(lessers) {
+	default:
+		// multiple less functions specified.
+		// create a compound less function.
+		less = func(a, b string) bool {
+			for i := 0; i < len(lessers)-1; i++ {
+				if lessers[i](a, b) {
+					return true
+				}
+				if lessers[i](b, a) {
+					return false
+				}
+			}
+			return lessers[len(lessers)-1](a, b)
+		}
+	case 0:
+		// no less function
+	case 1:
+		less = lessers[0]
+	}
+	return less
+}
+
 // createIndex is called by CreateIndex() and CreateSpatialIndex()
 func (tx *Tx) createIndex(name string, pattern string,
 	lessers []func(a, b string) bool,
@@ -2145,27 +2209,7 @@ func (tx *Tx) createIndex(name string, pattern string,
 		return ErrIndexExists
 	}
 	// genreate a less function
-	var less func(a, b string) bool
-	switch len(lessers) {
-	default:
-		// multiple less functions specified.
-		// create a compound less function.
-		less = func(a, b string) bool {
-			for i := 0; i < len(lessers)-1; i++ {
-				if lessers[i](a, b) {
-					return true
-				}
-				if lessers[i](b, a) {
-					return false
-				}
-			}
-			return lessers[len(lessers)-1](a, b)
-		}
-	case 0:
-		// no less function
-	case 1:
-		less = lessers[0]
-	}
+	less := makeLessFunc(lessers)
 	var sopts IndexOptions
 	if opts != nil {
 		sopts = *opts
