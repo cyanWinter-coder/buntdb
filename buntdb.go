@@ -8,8 +8,11 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"hash"
+	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -60,6 +63,11 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrShrinkVerification is returned when the shrunken aof file fails
+	// its post-write verification (length, tail marker, or checksum).
+	// The original aof is left untouched and the shrink may be retried.
+	ErrShrinkVerification = errors.New("shrink verification failed")
 )
 
 const useAbsEx = true
@@ -80,6 +88,11 @@ type DB struct {
 	persist   bool              // do we write to disk
 	shrinking bool              // when an aof shrink is in-process.
 	lastaofsz int               // the size of the last shrink aof size
+	// shrinkEndpos is the offset in the aof at which the in-process
+	// shrink started. Transactions that commit behind this offset are
+	// copied into the shrunk file during the final switch. A
+	// partial-write rollback may rewind this offset.
+	shrinkEndpos int64
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -168,6 +181,11 @@ func Open(path string) (*DB, error) {
 			_ = db.file.Close()
 			return nil, err
 		}
+		// Remove a stale tmp file left behind by a shrink operation that
+		// crashed before the atomic rename. The rename is atomic, so a
+		// leftover tmp file is always garbage from an incomplete shrink
+		// and the main aof is the authoritative file.
+		_ = os.Remove(path + ".tmp")
 	}
 	// start the background manager.
 	go db.backgroundManager()
@@ -647,6 +665,24 @@ func (db *DB) Sync() error {
 
 // Shrink will make the database file smaller by removing redundant
 // log entries. This operation does not block the database.
+//
+// The shrink is performed as a crash-safe transaction:
+//
+//  1. All live items are rewritten to a tmp file, starting from a
+//     consistent point in time. The offset of the aof at that moment is
+//     recorded as the replay start point for transactions that commit
+//     while the rewrite is running.
+//  2. The commands that were appended behind the replay start point are
+//     copied to the tmp file, followed by a footer containing the payload
+//     length and a checksum. The tmp file is synced to disk and verified
+//     (length, tail marker, and checksum) before it may replace the aof.
+//  3. The tmp file atomically replaces the aof with a rename. A crash
+//     before the rename leaves the old aof untouched; a crash after the
+//     rename leaves the new aof, which is validated and recovered through
+//     its footer on the next open.
+//
+// If any step fails, an error is returned, the original aof is left in
+// place, and the shrink can be retried.
 func (db *DB) Shrink() error {
 	db.mu.Lock()
 	if db.closed {
@@ -672,12 +708,16 @@ func (db *DB) Shrink() error {
 	}()
 	fname := db.file.Name()
 	tmpname := fname + ".tmp"
-	// the endpos is used to return to the end of the file when we are
-	// finished writing all of the current items.
+	// Record the current end of the aof as the replay start point. Every
+	// transaction that commits from this moment on is appended behind
+	// this offset and will be copied into the shrunk file during the
+	// final switch, so the snapshot below does not need to include them.
 	endpos, err := db.file.Seek(0, 2)
 	if err != nil {
+		db.mu.Unlock()
 		return err
 	}
+	db.shrinkEndpos = endpos
 	db.mu.Unlock()
 	time.Sleep(time.Second / 4) // wait just a bit before starting
 	f, err := os.Create(tmpname)
@@ -686,8 +726,18 @@ func (db *DB) Shrink() error {
 	}
 	defer func() {
 		_ = f.Close()
+		// If the tmp file still exists at this point then the shrink did
+		// not complete. Remove it so that a stale snapshot is never
+		// mistaken for a live one. After a successful rename the tmp
+		// file no longer exists and this is a no-op, so the new aof is
+		// never deleted, not even by a concurrent or repeated Close.
 		_ = os.RemoveAll(tmpname)
 	}()
+
+	// All snapshot and replay bytes are funneled through sw so that the
+	// exact payload length and its checksum are known when it is time to
+	// write the footer.
+	sw := &shrinkWriter{w: f, h: crc32.NewIEEE()}
 
 	// we are going to read items in as chunks as to not hold up the database
 	// for too long.
@@ -719,7 +769,7 @@ func (db *DB) Shrink() error {
 				},
 			)
 			if len(buf) > 0 {
-				if _, err := f.Write(buf); err != nil {
+				if _, err := sw.Write(buf); err != nil {
 					return err
 				}
 				buf = buf[:0]
@@ -749,16 +799,29 @@ func (db *DB) Shrink() error {
 			return err
 		}
 		defer func() { _ = aof.Close() }()
-		if _, err := aof.Seek(endpos, 0); err != nil {
+		// Replay every transaction that committed while the snapshot was
+		// being written. shrinkEndpos may have been rewound by a
+		// partial-write rollback, so it always points at the first byte
+		// that is not covered by the snapshot.
+		if _, err := aof.Seek(db.shrinkEndpos, 0); err != nil {
 			return err
 		}
 		// Just copy all of the new commands that have occurred since we
 		// started the shrink process.
-		if _, err := io.Copy(f, aof); err != nil {
+		if _, err := io.Copy(sw, aof); err != nil {
 			return err
 		}
 		// Close all files
 		if err := aof.Close(); err != nil {
+			return err
+		}
+		// Append the footer that marks the file as a complete shrink
+		// result. The footer carries the payload length and its checksum
+		// so that a crash at any point after the rename can be detected
+		// and recovered on the next open.
+		payloadLen := sw.n
+		if _, err := f.Write(appendShrinkFooter(nil, payloadLen,
+			sw.h.Sum32())); err != nil {
 			return err
 		}
 		if err := f.Sync(); err != nil {
@@ -767,15 +830,39 @@ func (db *DB) Shrink() error {
 		if err := f.Close(); err != nil {
 			return err
 		}
+		// Verify the length, tail marker, and checksum of the shrunk file
+		// before it is allowed to replace the live aof.
+		if err := verifyShrinkFile(tmpname); err != nil {
+			return err
+		}
 		if err := db.file.Close(); err != nil {
 			return err
 		}
-		// Any failures below here are really bad. So just panic.
 		if err := renameFile(tmpname, fname); err != nil {
-			panicErr(err)
+			// The rename failed, so the old aof is still intact. Reopen
+			// it so that the database stays usable and the shrink can be
+			// retried, and report the failure to the caller.
+			file, err2 := os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
+			if err2 != nil {
+				panicErr(err2)
+			}
+			db.file = file
+			if _, err2 := db.file.Seek(0, 2); err2 != nil {
+				panicErr(err2)
+			}
+			return err
 		}
+		// Make the rename itself durable.
+		syncDir(filepath.Dir(fname))
 		db.file, err = os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
 		if err != nil {
+			panicErr(err)
+		}
+		// Remove the footer so that new commands are appended directly
+		// behind the payload. If the process crashes before this
+		// truncate, the next open will find the footer, validate it, and
+		// truncate it instead.
+		if err := db.file.Truncate(payloadLen); err != nil {
 			panicErr(err)
 		}
 		pos, err := db.file.Seek(0, 2)
@@ -785,6 +872,113 @@ func (db *DB) Shrink() error {
 		db.lastaofsz = int(pos)
 		return nil
 	}()
+}
+
+// shrinkFooterMagic marks the fixed-size footer that is appended to a
+// freshly shrunk aof file. The footer layout is:
+//
+//	'\n' "BUNTDBSHRINK|" <20 zero-padded decimal payload length> '|'
+//	<8 lowercase hex crc32 of the payload> '\n'
+const shrinkFooterMagic = "BUNTDBSHRINK|"
+const shrinkFooterSize = int64(1 + len(shrinkFooterMagic) + 20 + 1 + 8 + 1)
+
+// shrinkWriter counts and checksums every byte that passes through it.
+type shrinkWriter struct {
+	w io.Writer   // the underlying writer
+	h hash.Hash32 // running checksum of the payload
+	n int64       // number of payload bytes written
+}
+
+func (sw *shrinkWriter) Write(p []byte) (int, error) {
+	n, err := sw.w.Write(p)
+	_, _ = sw.h.Write(p[:n])
+	sw.n += int64(n)
+	return n, err
+}
+
+// appendShrinkFooter appends a shrink footer for a payload of datalen
+// bytes with the provided crc32 checksum.
+func appendShrinkFooter(buf []byte, datalen int64, crc uint32) []byte {
+	return append(buf, []byte(fmt.Sprintf("\n%s%020d|%08x\n",
+		shrinkFooterMagic, datalen, crc))...)
+}
+
+// hasShrinkFooter returns true if the buffer looks like a shrink footer.
+func hasShrinkFooter(footer []byte) bool {
+	return int64(len(footer)) == shrinkFooterSize &&
+		footer[0] == '\n' &&
+		string(footer[1:1+len(shrinkFooterMagic)]) == shrinkFooterMagic
+}
+
+// parseShrinkFooter parses a shrink footer and returns the payload length
+// and checksum that it carries.
+func parseShrinkFooter(footer []byte) (datalen int64, crc uint32, err error) {
+	if !hasShrinkFooter(footer) ||
+		footer[1+len(shrinkFooterMagic)+20] != '|' ||
+		footer[len(footer)-1] != '\n' {
+		return 0, 0, ErrInvalid
+	}
+	dlen, err := strconv.ParseInt(
+		string(footer[1+len(shrinkFooterMagic):1+len(shrinkFooterMagic)+20]),
+		10, 64)
+	if err != nil {
+		return 0, 0, ErrInvalid
+	}
+	c, err := strconv.ParseUint(
+		string(footer[2+len(shrinkFooterMagic)+20:2+len(shrinkFooterMagic)+28]),
+		16, 32)
+	if err != nil {
+		return 0, 0, ErrInvalid
+	}
+	return dlen, uint32(c), nil
+}
+
+// verifyShrinkFile checks that the file at path is a complete shrink
+// result: it must end with a valid tail marker, the payload length in the
+// marker must match the file size, and the payload checksum must match.
+func verifyShrinkFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Size() < shrinkFooterSize {
+		return ErrShrinkVerification
+	}
+	footer := make([]byte, shrinkFooterSize)
+	if _, err := f.ReadAt(footer, fi.Size()-shrinkFooterSize); err != nil {
+		return err
+	}
+	datalen, crc, err := parseShrinkFooter(footer)
+	if err != nil {
+		return ErrShrinkVerification
+	}
+	if datalen != fi.Size()-shrinkFooterSize {
+		return ErrShrinkVerification
+	}
+	h := crc32.NewIEEE()
+	if _, err := io.Copy(h, io.NewSectionReader(f, 0, datalen)); err != nil {
+		return err
+	}
+	if h.Sum32() != crc {
+		return ErrShrinkVerification
+	}
+	return nil
+}
+
+// syncDir flushes a directory to stable storage, best effort. This makes
+// a rename inside the directory durable across a crash.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer func() { _ = d.Close() }()
+	_ = d.Sync()
 }
 
 func panicErr(err error) error {
@@ -990,7 +1184,45 @@ func (db *DB) load() error {
 	if err != nil {
 		return err
 	}
-	n, err := db.readLoad(db.file, fi.ModTime())
+	// Detect a shrink footer at the end of the file. A valid footer proves
+	// that the file is the result of a completed shrink whose rename was
+	// durable but whose footer truncation did not happen (a crash in
+	// between). Only the payload in front of the footer is loaded, and the
+	// footer is truncated away so that new commands append cleanly.
+	size := fi.Size()
+	limit := size
+	shrunk := false
+	if size >= shrinkFooterSize {
+		footer := make([]byte, shrinkFooterSize)
+		if _, err := db.file.ReadAt(footer, size-shrinkFooterSize); err != nil {
+			return err
+		}
+		if hasShrinkFooter(footer) {
+			// The file claims to be a completed shrink. Validate the
+			// length and checksum before trusting any of it.
+			datalen, crc, err := parseShrinkFooter(footer)
+			if err != nil {
+				return err
+			}
+			if datalen != size-shrinkFooterSize {
+				return ErrInvalid
+			}
+			h := crc32.NewIEEE()
+			if _, err := io.Copy(h,
+				io.NewSectionReader(db.file, 0, datalen)); err != nil {
+				return err
+			}
+			if h.Sum32() != crc {
+				return ErrInvalid
+			}
+			limit = datalen
+			shrunk = true
+		}
+	}
+	if _, err := db.file.Seek(0, 0); err != nil {
+		return err
+	}
+	n, err := db.readLoad(io.LimitReader(db.file, limit), fi.ModTime())
 	if err != nil {
 		if err == io.ErrUnexpectedEOF {
 			// The db file has ended mid-command, which is allowed but the
@@ -1000,6 +1232,12 @@ func (db *DB) load() error {
 				return err
 			}
 		} else {
+			return err
+		}
+	} else if shrunk {
+		// Remove the shrink footer so that new commands are appended
+		// directly behind the payload.
+		if err := db.file.Truncate(limit); err != nil {
 			return err
 		}
 	}
@@ -1261,6 +1499,15 @@ func (tx *Tx) Commit() error {
 				}
 				if err := tx.db.file.Truncate(pos); err != nil {
 					panicErr(err)
+				}
+				if tx.db.shrinking && pos < tx.db.shrinkEndpos {
+					// A shrink in progress recorded the end of the aof
+					// as its replay start point, but the bytes behind
+					// pos were just rolled back. Rewind the replay
+					// start point so that the shrunk file does not
+					// include the rolled-back data or skip commands
+					// that will be rewritten at this offset.
+					tx.db.shrinkEndpos = pos
 				}
 			}
 			tx.rollbackInner()
